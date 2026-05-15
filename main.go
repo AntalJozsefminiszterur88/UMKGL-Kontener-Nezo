@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,6 +40,7 @@ func main() {
 
 	a := app.NewWithID("hu.umkgl.kontener.nezo")
 	a.Settings().SetTheme(theme.DarkTheme())
+	a.SetIcon(theme.ComputerIcon())
 
 	w := a.NewWindow("UMKGL Konténer Néző")
 	w.Resize(fyne.NewSize(600, 400))
@@ -93,6 +95,12 @@ func buildContainerList(w fyne.Window) *fyne.Container {
 	if err != nil {
 		return container.NewVBox(widget.NewLabel("Hiba a Docker csatlakozáskor:\n" + err.Error()))
 	}
+
+	sort.Slice(containers, func(i, j int) bool {
+		nameI := strings.TrimPrefix(containers[i].Names[0], "/")
+		nameJ := strings.TrimPrefix(containers[j].Names[0], "/")
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
 
 	list := container.NewVBox()
 
@@ -149,13 +157,9 @@ func showLogs(containerID, containerName string) {
 	logWindow := fyne.CurrentApp().NewWindow(fmt.Sprintf("Napló: %s", containerName))
 	logWindow.Resize(fyne.NewSize(800, 600))
 	
-	logText := widget.NewMultiLineEntry()
-	logText.Disable() // Read only
-	logText.Wrapping = fyne.TextWrapWord
-	// Set a monospaced font style for better readability
-	logText.TextStyle = fyne.TextStyle{Monospace: true}
+	logGrid := widget.NewTextGrid()
 	
-	scroll := container.NewScroll(logText)
+	scroll := container.NewScroll(logGrid)
 	logWindow.SetContent(scroll)
 	logWindow.Show()
 
@@ -175,13 +179,15 @@ func showLogs(containerID, containerName string) {
 		
 		reader, err := dockerClient.ContainerLogs(ctx, containerID, logOptions)
 		if err != nil {
-			logText.SetText(fmt.Sprintf("Hiba a napló olvasásakor: %v", err))
+			logGrid.SetText(fmt.Sprintf("Hiba a napló olvasásakor: %v", err))
 			return
 		}
 		defer reader.Close()
 
 		inspect, err := dockerClient.ContainerInspect(ctx, containerID)
 		isTty := err == nil && inspect.Config.Tty
+
+		var lines []string
 
 		// We use a scanner to read lines and append to the text box
 		if isTty {
@@ -191,12 +197,11 @@ func showLogs(containerID, containerName string) {
 				case <-ctx.Done():
 					return
 				default:
-					line := scanner.Text()
-					current := logText.Text
-					if len(current) > 100000 { // Limit log size
-						current = current[len(current)-50000:]
+					lines = append(lines, scanner.Text())
+					if len(lines) > 200 {
+						lines = lines[len(lines)-200:]
 					}
-					logText.SetText(current + line + "\n")
+					logGrid.SetText(strings.Join(lines, "\n"))
 					scroll.ScrollToBottom()
 				}
 			}
@@ -214,12 +219,11 @@ func showLogs(containerID, containerName string) {
 				case <-ctx.Done():
 					return
 				default:
-					line := scanner.Text()
-					current := logText.Text
-					if len(current) > 100000 {
-						current = current[len(current)-50000:]
+					lines = append(lines, scanner.Text())
+					if len(lines) > 200 {
+						lines = lines[len(lines)-200:]
 					}
-					logText.SetText(current + line + "\n")
+					logGrid.SetText(strings.Join(lines, "\n"))
 					scroll.ScrollToBottom()
 				}
 			}

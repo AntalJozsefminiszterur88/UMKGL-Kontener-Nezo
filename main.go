@@ -26,16 +26,10 @@ var dockerClient *client.Client
 
 func main() {
 	var err error
-	// Try connecting to Docker Desktop first, then fallback to default
-	dockerClient, err = client.NewClientWithOpts(
-		client.WithHost("unix:///home/server/.docker/desktop/docker.sock"),
-		client.WithAPIVersionNegotiation(),
-	)
+	// Connect to native Linux Docker Daemon
+	dockerClient, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		dockerClient, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-		if err != nil {
-			log.Fatal(err)
-		}
+		log.Fatal(err)
 	}
 
 	a := app.NewWithID("hu.umkgl.kontener.nezo")

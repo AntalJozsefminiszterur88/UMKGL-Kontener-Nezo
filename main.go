@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -24,12 +25,19 @@ var dockerClient *client.Client
 
 func main() {
 	var err error
-	dockerClient, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	// Try connecting to Docker Desktop first, then fallback to default
+	dockerClient, err = client.NewClientWithOpts(
+		client.WithHost("unix:///home/server/.docker/desktop/docker.sock"),
+		client.WithAPIVersionNegotiation(),
+	)
 	if err != nil {
-		log.Fatal(err)
+		dockerClient, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
-	a := app.New()
+	a := app.NewWithID("hu.umkgl.kontener.nezo")
 	a.Settings().SetTheme(theme.DarkTheme())
 
 	w := a.NewWindow("UMKGL Konténer Néző")
@@ -50,7 +58,7 @@ func main() {
 	w.SetContent(mainContent)
 
 	if desk, ok := a.(desktop.App); ok {
-		m := fyne.NewMenu("UMKGL Konténer",
+		m := fyne.NewMenu("UMKGL Konténer Néző",
 			fyne.NewMenuItem("Megnyitás", func() {
 				w.Show()
 			}),
@@ -113,7 +121,7 @@ func buildContainerList(w fyne.Window) *fyne.Container {
 			go dockerClient.ContainerRestart(ctx, id, dockercontainer.StopOptions{})
 		})
 		logBtn := widget.NewButtonWithIcon("", theme.DocumentIcon(), func() {
-			showLogs(w, id, name)
+			showLogs(id, name)
 		})
 
 		if state == "running" {
@@ -137,36 +145,84 @@ func buildContainerList(w fyne.Window) *fyne.Container {
 	return list
 }
 
-func showLogs(w fyne.Window, containerID, containerName string) {
-	ctx := context.Background()
-	logOptions := dockercontainer.LogsOptions{ShowStdout: true, ShowStderr: true, Tail: "200"}
-	
-	reader, err := dockerClient.ContainerLogs(ctx, containerID, logOptions)
-	if err != nil {
-		return
-	}
-
-	outBuf := new(strings.Builder)
-	errBuf := new(strings.Builder)
-	
-	// Determine if container has TTY
-	inspect, err := dockerClient.ContainerInspect(ctx, containerID)
-	if err == nil && inspect.Config.Tty {
-		_, _ = io.Copy(outBuf, reader)
-	} else {
-		_, _ = stdcopy.StdCopy(outBuf, errBuf, reader)
-	}
-	reader.Close()
-
-	logText := widget.NewMultiLineEntry()
-	logText.SetText(outBuf.String() + errBuf.String())
-	logText.Disable() // Read only
-	logText.Wrapping = fyne.TextWrapWord
-	
-	scroll := container.NewScroll(logText)
-	
+func showLogs(containerID, containerName string) {
 	logWindow := fyne.CurrentApp().NewWindow(fmt.Sprintf("Napló: %s", containerName))
 	logWindow.Resize(fyne.NewSize(800, 600))
+	
+	logText := widget.NewMultiLineEntry()
+	logText.Disable() // Read only
+	logText.Wrapping = fyne.TextWrapWord
+	// Set a monospaced font style for better readability
+	logText.TextStyle = fyne.TextStyle{Monospace: true}
+	
+	scroll := container.NewScroll(logText)
 	logWindow.SetContent(scroll)
 	logWindow.Show()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	logWindow.SetOnClosed(func() {
+		cancel()
+	})
+
+	go func() {
+		logOptions := dockercontainer.LogsOptions{
+			ShowStdout: true,
+			ShowStderr: true,
+			Tail:       "100",
+			Follow:     true, // Real-time follow
+		}
+		
+		reader, err := dockerClient.ContainerLogs(ctx, containerID, logOptions)
+		if err != nil {
+			logText.SetText(fmt.Sprintf("Hiba a napló olvasásakor: %v", err))
+			return
+		}
+		defer reader.Close()
+
+		inspect, err := dockerClient.ContainerInspect(ctx, containerID)
+		isTty := err == nil && inspect.Config.Tty
+
+		// We use a scanner to read lines and append to the text box
+		if isTty {
+			scanner := bufio.NewScanner(reader)
+			for scanner.Scan() {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					line := scanner.Text()
+					current := logText.Text
+					if len(current) > 100000 { // Limit log size
+						current = current[len(current)-50000:]
+					}
+					logText.SetText(current + line + "\n")
+					scroll.ScrollToBottom()
+				}
+			}
+		} else {
+			// stdcopy is needed for non-TTY containers to strip multiplex headers
+			pr, pw := io.Pipe()
+			go func() {
+				defer pw.Close()
+				_, _ = stdcopy.StdCopy(pw, pw, reader)
+			}()
+			
+			scanner := bufio.NewScanner(pr)
+			for scanner.Scan() {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					line := scanner.Text()
+					current := logText.Text
+					if len(current) > 100000 {
+						current = current[len(current)-50000:]
+					}
+					logText.SetText(current + line + "\n")
+					scroll.ScrollToBottom()
+				}
+			}
+		}
+	}()
 }

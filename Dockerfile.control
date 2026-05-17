@@ -1,0 +1,20 @@
+FROM golang:1.25 AS build
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd ./cmd
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/factorio-control-api ./cmd/factorio-control-api
+
+FROM gcr.io/distroless/static-debian12
+
+COPY --from=build /out/factorio-control-api /factorio-control-api
+
+ENV CONTROL_API_BIND_ADDR=:8080
+ENV CONTROL_TARGET_CONTAINER=factorio-server
+ENV CONTROL_STOP_TIMEOUT_SECONDS=120
+
+ENTRYPOINT ["/factorio-control-api"]

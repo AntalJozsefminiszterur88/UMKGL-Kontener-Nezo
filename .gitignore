@@ -35,3 +35,4 @@ obj/
 .vs/
 node_modules/
 dist/
+.env.control

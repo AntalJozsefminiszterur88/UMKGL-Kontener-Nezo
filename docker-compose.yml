@@ -1,0 +1,17 @@
+services:
+  factorio-control-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+    container_name: factorio-control-api
+    restart: unless-stopped
+    env_file:
+      - .env.control
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - umkgl-network
+
+networks:
+  umkgl-network:
+    external: true

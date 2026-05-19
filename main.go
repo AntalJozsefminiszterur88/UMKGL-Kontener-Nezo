@@ -64,9 +64,25 @@ type containerGroup struct {
 	Indices []int
 }
 
+type groupViewModel struct {
+	Key            string
+	Label          string
+	StatusText     string
+	Importance     widget.Importance
+	IDs            []string
+	Names          []string
+	DisableStart   bool
+	DisableStop    bool
+	DisableRestart bool
+}
+
 type uiState struct {
-	content    *container.Scroll
+	content    *fyne.Container
+	list       *widget.List
 	refreshBtn *widget.Button
+
+	rowsMu sync.RWMutex
+	rows   []groupViewModel
 
 	statusMu      sync.RWMutex
 	groupStatuses map[string]groupStatus
@@ -93,11 +109,25 @@ func main() {
 	appCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	content := container.NewVScroll(container.NewVBox())
 	ui := &uiState{
-		content:       content,
 		groupStatuses: make(map[string]groupStatus),
 	}
+	ui.list = widget.NewList(
+		func() int {
+			return ui.rowCount()
+		},
+		func() fyne.CanvasObject {
+			return newGroupRowWidget(ui)
+		},
+		func(id widget.ListItemID, object fyne.CanvasObject) {
+			row, ok := object.(*groupRowWidget)
+			if !ok {
+				return
+			}
+			row.bind(ui.rowAt(id))
+		},
+	)
+	ui.content = container.NewMax(ui.list)
 
 	refreshBtn := widget.NewButtonWithIcon("Frissítés", theme.ViewRefreshIcon(), ui.requestRefresh)
 	ui.refreshBtn = refreshBtn
@@ -107,7 +137,7 @@ func main() {
 		layout.NewSpacer(),
 		refreshBtn,
 	)
-	mainContent := container.NewBorder(topBar, nil, nil, nil, content)
+	mainContent := container.NewBorder(topBar, nil, nil, nil, ui.content)
 	w.SetContent(mainContent)
 
 	if desk, ok := a.(desktop.App); ok {
@@ -154,6 +184,38 @@ func (s *uiState) setRefreshButtonBusy(busy bool) {
 	})
 }
 
+func (s *uiState) rowCount() int {
+	s.rowsMu.RLock()
+	defer s.rowsMu.RUnlock()
+	return len(s.rows)
+}
+
+func (s *uiState) rowAt(index int) groupViewModel {
+	s.rowsMu.RLock()
+	defer s.rowsMu.RUnlock()
+
+	if index < 0 || index >= len(s.rows) {
+		return groupViewModel{}
+	}
+
+	return s.rows[index]
+}
+
+func (s *uiState) setRows(rows []groupViewModel) {
+	s.rowsMu.Lock()
+	s.rows = rows
+	s.rowsMu.Unlock()
+}
+
+func (s *uiState) showMainView(view fyne.CanvasObject) {
+	if s.content == nil {
+		return
+	}
+
+	s.content.Objects = []fyne.CanvasObject{view}
+	s.content.Refresh()
+}
+
 func (s *uiState) setGroupStatus(key string, status groupStatus) {
 	s.statusMu.Lock()
 	s.groupStatuses[key] = status
@@ -197,13 +259,19 @@ func (s *uiState) flashGroupStatus(key, text string, importance widget.Importanc
 func (s *uiState) refreshNow() {
 	containers, err := listContainers()
 	if err != nil {
-		s.content.Content = buildDockerErrorView(err)
-		s.content.Refresh()
+		s.showMainView(buildDockerErrorView(err))
 		return
 	}
 
-	s.content.Content = buildContainerList(s, containers)
-	s.content.Refresh()
+	rows := buildGroupViewModels(s, containers)
+	if len(rows) == 0 {
+		s.showMainView(buildEmptyView())
+		return
+	}
+
+	s.setRows(rows)
+	s.list.Refresh()
+	s.showMainView(s.list)
 }
 
 func (s *uiState) requestRefresh() {
@@ -237,11 +305,17 @@ func (s *uiState) requestRefresh() {
 		containers, err := listContainers()
 		fyne.DoAndWait(func() {
 			if err != nil {
-				s.content.Content = buildDockerErrorView(err)
+				s.showMainView(buildDockerErrorView(err))
 			} else {
-				s.content.Content = buildContainerList(s, containers)
+				rows := buildGroupViewModels(s, containers)
+				if len(rows) == 0 {
+					s.showMainView(buildEmptyView())
+				} else {
+					s.setRows(rows)
+					s.list.Refresh()
+					s.showMainView(s.list)
+				}
 			}
-			s.content.Refresh()
 		})
 	}()
 }
@@ -257,7 +331,11 @@ func buildDockerErrorView(err error) fyne.CanvasObject {
 	return container.NewVBox(widget.NewLabel("Hiba a Docker csatlakozáskor:\n" + err.Error()))
 }
 
-func buildContainerList(ui *uiState, containers []dockercontainer.Summary) *fyne.Container {
+func buildEmptyView() fyne.CanvasObject {
+	return container.NewVBox(widget.NewLabel("Nincsenek konténerek."))
+}
+
+func buildGroupViewModels(ui *uiState, containers []dockercontainer.Summary) []groupViewModel {
 	groupsMap := make(map[string]*containerGroup)
 
 	for i, ctr := range containers {
@@ -291,7 +369,7 @@ func buildContainerList(ui *uiState, containers []dockercontainer.Summary) *fyne
 		return strings.ToLower(groups[i].Label) < strings.ToLower(groups[j].Label)
 	})
 
-	list := container.NewVBox()
+	rows := make([]groupViewModel, 0, len(groups))
 
 	for _, group := range groups {
 		allRunning := true
@@ -319,107 +397,20 @@ func buildContainerList(ui *uiState, containers []dockercontainer.Summary) *fyne
 			importance = statusOverride.Importance
 		}
 
-		nameLabel := widget.NewLabelWithStyle(group.Label, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-		statusLabel := widget.NewLabel(statusText)
-		statusLabel.Importance = importance
-
-		var startBtn, stopBtn, restartBtn *widget.Button
-
-		setLocalStatus := func(text string, importance widget.Importance) {
-			statusLabel.SetText(text)
-			statusLabel.Importance = importance
-			statusLabel.Refresh()
-		}
-
-		setBusyLocally := func(text string) {
-			setLocalStatus(text, widget.WarningImportance)
-			startBtn.Disable()
-			stopBtn.Disable()
-			restartBtn.Disable()
-		}
-
-		startBtn = widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() {
-			runGroupAction(
-				ui,
-				group.Key,
-				"Indítás folyamatban...",
-				"Indítás sikertelen",
-				ids,
-				func() {
-					setBusyLocally("Indítás folyamatban...")
-				},
-				func(ctx context.Context, id string) error {
-					return dockerClient.ContainerStart(ctx, id, dockercontainer.StartOptions{})
-				},
-			)
+		rows = append(rows, groupViewModel{
+			Key:            group.Key,
+			Label:          group.Label,
+			StatusText:     statusText,
+			Importance:     importance,
+			IDs:            ids,
+			Names:          names,
+			DisableStart:   (len(ids) == 0) || (hasOverride && statusOverride.Busy) || allRunning,
+			DisableStop:    (len(ids) == 0) || (hasOverride && statusOverride.Busy) || allStopped,
+			DisableRestart: (len(ids) == 0) || (hasOverride && statusOverride.Busy) || allStopped,
 		})
-
-		stopBtn = widget.NewButtonWithIcon("", theme.MediaStopIcon(), func() {
-			runGroupAction(
-				ui,
-				group.Key,
-				"Leállítás folyamatban...",
-				"Leállítás sikertelen",
-				ids,
-				func() {
-					setBusyLocally("Leállítás folyamatban...")
-				},
-				func(ctx context.Context, id string) error {
-					return dockerClient.ContainerStop(ctx, id, newStopOptions())
-				},
-			)
-		})
-
-		restartBtn = widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
-			runGroupAction(
-				ui,
-				group.Key,
-				"Újraindítás folyamatban...",
-				"Újraindítás sikertelen",
-				ids,
-				func() {
-					setBusyLocally("Újraindítás folyamatban...")
-				},
-				func(ctx context.Context, id string) error {
-					return dockerClient.ContainerRestart(ctx, id, newStopOptions())
-				},
-			)
-		})
-
-		logBtn := widget.NewButtonWithIcon("", theme.DocumentIcon(), func() {
-			if len(ids) == 1 {
-				showLogs(ids[0], names[0])
-				return
-			}
-
-			showLogPicker(group.Label, ids, names)
-		})
-
-		if allRunning {
-			startBtn.Disable()
-		} else if allStopped {
-			stopBtn.Disable()
-			restartBtn.Disable()
-		}
-
-		if hasOverride && statusOverride.Busy {
-			startBtn.Disable()
-			stopBtn.Disable()
-			restartBtn.Disable()
-		}
-
-		buttons := container.NewHBox(startBtn, stopBtn, restartBtn, logBtn)
-		row := container.NewBorder(nil, nil, nameLabel, buttons, statusLabel)
-
-		list.Add(row)
-		list.Add(widget.NewSeparator())
 	}
 
-	if len(groups) == 0 {
-		list.Add(widget.NewLabel("Nincsenek konténerek."))
-	}
-
-	return list
+	return rows
 }
 
 func buildGroupStatus(containers []dockercontainer.Summary, indices []int, allRunning, allStopped bool) (string, widget.Importance) {
@@ -443,6 +434,140 @@ func buildGroupStatus(containers []dockercontainer.Summary, indices []int, allRu
 	}
 
 	return containers[indices[0]].Status, importance
+}
+
+type groupRowWidget struct {
+	widget.BaseWidget
+
+	ui *uiState
+
+	nameLabel   *widget.Label
+	statusLabel *widget.Label
+	startBtn    *widget.Button
+	stopBtn     *widget.Button
+	restartBtn  *widget.Button
+	logBtn      *widget.Button
+}
+
+func newGroupRowWidget(ui *uiState) *groupRowWidget {
+	row := &groupRowWidget{
+		ui:          ui,
+		nameLabel:   widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		statusLabel: widget.NewLabel(""),
+		startBtn:    widget.NewButtonWithIcon("", theme.MediaPlayIcon(), nil),
+		stopBtn:     widget.NewButtonWithIcon("", theme.MediaStopIcon(), nil),
+		restartBtn:  widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), nil),
+		logBtn:      widget.NewButtonWithIcon("", theme.DocumentIcon(), nil),
+	}
+	row.ExtendBaseWidget(row)
+	return row
+}
+
+func (r *groupRowWidget) CreateRenderer() fyne.WidgetRenderer {
+	buttons := container.NewHBox(r.startBtn, r.stopBtn, r.restartBtn, r.logBtn)
+	content := container.NewVBox(
+		container.NewBorder(nil, nil, r.nameLabel, buttons, r.statusLabel),
+		widget.NewSeparator(),
+	)
+	return widget.NewSimpleRenderer(content)
+}
+
+func (r *groupRowWidget) bind(group groupViewModel) {
+	r.nameLabel.SetText(group.Label)
+	r.statusLabel.SetText(group.StatusText)
+	r.statusLabel.Importance = group.Importance
+
+	groupIDs := append([]string(nil), group.IDs...)
+	groupNames := append([]string(nil), group.Names...)
+	groupKey := group.Key
+	groupLabel := group.Label
+
+	r.startBtn.OnTapped = func() {
+		runGroupAction(
+			r.ui,
+			groupKey,
+			"Indítás folyamatban...",
+			"Indítás sikertelen",
+			groupIDs,
+			func() {
+				r.setBusyLocally("Indítás folyamatban...")
+			},
+			func(ctx context.Context, id string) error {
+				return dockerClient.ContainerStart(ctx, id, dockercontainer.StartOptions{})
+			},
+		)
+	}
+
+	r.stopBtn.OnTapped = func() {
+		runGroupAction(
+			r.ui,
+			groupKey,
+			"Leállítás folyamatban...",
+			"Leállítás sikertelen",
+			groupIDs,
+			func() {
+				r.setBusyLocally("Leállítás folyamatban...")
+			},
+			func(ctx context.Context, id string) error {
+				return dockerClient.ContainerStop(ctx, id, newStopOptions())
+			},
+		)
+	}
+
+	r.restartBtn.OnTapped = func() {
+		runGroupAction(
+			r.ui,
+			groupKey,
+			"Újraindítás folyamatban...",
+			"Újraindítás sikertelen",
+			groupIDs,
+			func() {
+				r.setBusyLocally("Újraindítás folyamatban...")
+			},
+			func(ctx context.Context, id string) error {
+				return dockerClient.ContainerRestart(ctx, id, newStopOptions())
+			},
+		)
+	}
+
+	r.logBtn.OnTapped = func() {
+		if len(groupIDs) == 1 {
+			showLogs(groupIDs[0], groupNames[0])
+			return
+		}
+
+		showLogPicker(groupLabel, groupIDs, groupNames)
+	}
+
+	if group.DisableStart {
+		r.startBtn.Disable()
+	} else {
+		r.startBtn.Enable()
+	}
+
+	if group.DisableStop {
+		r.stopBtn.Disable()
+	} else {
+		r.stopBtn.Enable()
+	}
+
+	if group.DisableRestart {
+		r.restartBtn.Disable()
+	} else {
+		r.restartBtn.Enable()
+	}
+
+	r.logBtn.Enable()
+	r.Refresh()
+}
+
+func (r *groupRowWidget) setBusyLocally(text string) {
+	r.statusLabel.SetText(text)
+	r.statusLabel.Importance = widget.WarningImportance
+	r.startBtn.Disable()
+	r.stopBtn.Disable()
+	r.restartBtn.Disable()
+	r.Refresh()
 }
 
 func containerDisplayName(ctr dockercontainer.Summary) string {
